@@ -1,0 +1,148 @@
+esphome:
+  name: rklb-ticker
+  friendly_name: "RKLB Stock Ticker"
+  platform: ESP8266
+  board: nodemcuv2
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "RKLB-Ticker-Fallback"
+    password: "rklb1234"
+
+captive_portal:
+logger:
+api:
+  encryption:
+    key: !secret api_encryption_key
+ota:
+  password: !secret ota_password
+
+# ─── HTTP Request component ────────────────────────────────────────────────────
+http_request:
+  useragent: esphome/rklb-ticker
+  timeout: 10s
+
+# ─── SPI Bus ──────────────────────────────────────────────────────────────────
+spi:
+  clk_pin: GPIO14    # D5 → CLK
+  mosi_pin: GPIO13   # D7 → DIN (MOSI)
+
+# ─── Globals ──────────────────────────────────────────────────────────────────
+globals:
+  - id: price_str
+    type: std::string
+    restore_value: no
+    initial_value: '"--- "  '
+
+  - id: change_str
+    type: std::string
+    restore_value: no
+    initial_value: '"--- "  '
+
+  - id: scroll_pos
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+# ─── Time (needed for display refresh) ────────────────────────────────────────
+time:
+  - platform: sntp
+    id: sntp_time
+
+# ─── Interval: fetch stock data every 5 minutes ───────────────────────────────
+interval:
+  - interval: 300s
+    then:
+      - script.execute: fetch_stock
+
+  - interval: 50ms        # scroll speed — lower = faster
+    then:
+      - lambda: |-
+          id(scroll_pos) += 1;
+
+# ─── Script: fetch RKLB data via Yahoo Finance (unofficial JSON endpoint) ─────
+script:
+  - id: fetch_stock
+    then:
+      - http_request.get:
+          url: "https://query1.finance.yahoo.com/v8/finance/chart/RKLB?interval=1d&range=2d"
+          headers:
+            Accept: "application/json"
+          on_response:
+            then:
+              - lambda: |-
+                  // Parse the minimal fields we need from the Yahoo Finance JSON
+                  // Response structure:
+                  //   .chart.result[0].meta.regularMarketPrice  → current price
+                  //   .chart.result[0].meta.previousClose       → previous close
+                  std::string body = id(response).get_body();
+
+                  // Extract regularMarketPrice
+                  float price = 0.0f;
+                  float prev  = 0.0f;
+
+                  auto find_val = [&](const std::string& key) -> float {
+                    size_t pos = body.find("\"" + key + "\":");
+                    if (pos == std::string::npos) return 0.0f;
+                    pos += key.size() + 3;
+                    size_t end = body.find_first_of(",}", pos);
+                    std::string token = body.substr(pos, end - pos);
+                    return atof(token.c_str());
+                  };
+
+                  price = find_val("regularMarketPrice");
+                  prev  = find_val("previousClose");
+
+                  if (price > 0.0f && prev > 0.0f) {
+                    float change  = price - prev;
+                    float pct     = (change / prev) * 100.0f;
+
+                    char price_buf[16];
+                    char change_buf[24];
+                    snprintf(price_buf,  sizeof(price_buf),  "$%.2f", price);
+                    snprintf(change_buf, sizeof(change_buf), "%+.2f (%+.2f%%)",
+                             change, pct);
+
+                    id(price_str)  = std::string(price_buf);
+                    id(change_str) = std::string(change_buf);
+                  } else {
+                    id(price_str)  = "ERR";
+                    id(change_str) = "NO DATA";
+                  }
+                  id(scroll_pos) = 0;   // reset scroll on new data
+
+# ─── Font ─────────────────────────────────────────────────────────────────────
+# The '5x7' or '6x10' BDF fonts work well for 8-pixel-tall panels.
+# ESPHome ships a built-in font; reference it or drop your own .bdf into
+# the config directory.
+font:
+  - file: "gfonts://Roboto"
+    id: ticker_font
+    size: 8
+    glyphs: "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ "
+
+# ─── Display ──────────────────────────────────────────────────────────────────
+display:
+  - platform: max7219digit
+    cs_pin: GPIO12      # D6 → CS
+    num_chips: 4        # 4 × 8×8 = 32 columns
+    intensity: 5        # 0–15  (5 is comfortable indoors)
+    rotate_chip: 0      # adjust if your modules are rotated 180°
+    reverse_enable: false
+    update_interval: 50ms
+    lambda: |-
+      // Build the full message string
+      std::string msg = "  $RKLB  " + id(price_str) + "  " + id(change_str) + "   ";
+      int msg_len = msg.size();
+
+      // Each character is ~6 px wide; total pixel width of the message
+      int char_width = 6;
+      int total_px   = msg_len * char_width;
+
+      // Wrap scroll position
+      if (id(scroll_pos) >= total_px) id(scroll_pos) = 0;
+
+      // Draw scrolling text
+      it.scroll(id(scroll_pos), display::TextAlign::LEFT, id(ticker_font), msg.c_str());
