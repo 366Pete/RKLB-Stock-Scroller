@@ -1,0 +1,79 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Home Assistant: RKLB Stock Ticker – REST sensor + automation
+#
+# Add the sensor block to your configuration.yaml (or a split file),
+# and import the automation via the UI or automations.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 1. REST SENSOR  (configuration.yaml → sensor: section)
+sensor:
+  - platform: rest
+    name: "RKLB Stock"
+    resource: "https://query1.finance.yahoo.com/v8/finance/chart/RKLB?interval=1d&range=2d"
+    method: GET
+    headers:
+      User-Agent: "Mozilla/5.0"
+    scan_interval: 300   # seconds (5 min — be respectful of the free endpoint)
+    value_template: "{{ value_json.chart.result[0].meta.regularMarketPrice | round(2) }}"
+    json_attributes_template: >
+      {
+        "previousClose": {{ value_json.chart.result[0].meta.previousClose }},
+        "regularMarketPrice": {{ value_json.chart.result[0].meta.regularMarketPrice }}
+      }
+    unit_of_measurement: "USD"
+
+# 2. TEMPLATE SENSORS  (configuration.yaml → template: section)
+template:
+  - sensor:
+      - name: "RKLB Change"
+        unit_of_measurement: "USD"
+        state: >
+          {% set price = states('sensor.rklb_stock') | float(0) %}
+          {% set prev  = state_attr('sensor.rklb_stock', 'previousClose') | float(0) %}
+          {{ (price - prev) | round(2) }}
+
+      - name: "RKLB Pct Change"
+        unit_of_measurement: "%"
+        state: >
+          {% set price = states('sensor.rklb_stock') | float(0) %}
+          {% set prev  = state_attr('sensor.rklb_stock', 'previousClose') | float(0) %}
+          {% if prev > 0 %}
+            {{ (((price - prev) / prev) * 100) | round(2) }}
+          {% else %}
+            0
+          {% endif %}
+
+# 3. AUTOMATION  (automations.yaml  OR  UI → Automations → import YAML)
+#    Pushes a formatted text to the ESPHome device's global via the API.
+#    Requires the ESPHome "text_sensor" or a "number" entity exposed in HA.
+#    Alternatively just let the ESPHome device poll independently (YAML above).
+automation:
+  - alias: "Update RKLB Ticker Display"
+    trigger:
+      - platform: state
+        entity_id: sensor.rklb_stock
+    action:
+      - service: esphome.rklb_ticker_update_display
+        # If you expose a service from ESPHome via api: services:, call it here.
+        # Otherwise the ESPHome device polls autonomously — no action needed.
+        data:
+          price: "{{ states('sensor.rklb_stock') }}"
+          change: "{{ states('sensor.rklb_change') }}"
+          pct: "{{ states('sensor.rklb_pct_change') }}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTES
+# ─────────────────────────────────────────────────────────────────────────────
+# • The Yahoo Finance endpoint used here is unofficial/unauthenticated.
+#   It works reliably for personal projects but could break without notice.
+#   For a more robust solution, consider Alpha Vantage (free tier, API key req.)
+#   endpoint: https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=RKLB&apikey=YOUR_KEY
+#
+# • Market hours: RKLB trades on NASDAQ (Mon–Fri 9:30–16:00 ET).
+#   The price shown outside hours is the last official close / pre-market quote.
+#
+# • Wiring reminder:
+#     NodeMCU D5 (GPIO14) → CLK
+#     NodeMCU D7 (GPIO13) → DIN
+#     NodeMCU D6 (GPIO12) → CS
+#     5 V → VCC,  GND → GND
